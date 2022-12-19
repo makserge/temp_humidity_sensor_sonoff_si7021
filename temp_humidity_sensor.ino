@@ -1,4 +1,7 @@
 #include <Wire.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
 #include "OneButton.h"
 #include "src/WiFiManager/WiFiManager.h" // https://github.com/tzapu/WiFiManager
 #include "PubSubClient.h"
@@ -25,10 +28,11 @@
 
 #define HOSTNAME "tempsensor"   // http://tempsensor.local
 
-#define MQTT_BROKER "192.168.8.102"
+#define CONFIG_FILE "/config.json"
+
+#define MQTT_BROKER "192.168.8.100"
+#define MQTT_PORT "1883"
 #define MQTT_CLIENT_ID "tempsensor"
-#define MQTT_USER ""
-#define MQTT_PASS ""
 #define MQTT_ROOT_TOPIC "tempsensor"
 
 #define START_CHECKING_AFTER 15000 //15s
@@ -49,9 +53,18 @@ WiFiManager wm;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
+char mqttBroker[40] = MQTT_BROKER;
+char mqttPort[6] = MQTT_PORT;
+char mqttUser[20];
+char mqttPass[20];
+char mqttRootTopic[30] = MQTT_ROOT_TOPIC; 
+
+WiFiManagerParameter customMqttBroker, customMqttPort, customMqttUser, customMqttPass, customMqttRootTopic;
+
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   Serial.begin(115200);
+  loadCredentials();
   initButton();
   initSensor();
   initWifi();
@@ -73,16 +86,73 @@ void loop() {
     }    
     if (lastHum != hum) {
       lastHum = hum;
-     publishTempHum(temp, hum);
+      publishTempHum(temp, hum);
     }
     if (lastButtonState != buttonState) {
-      publishButton(buttonState);
+      if (buttonState) {
+        publishButton(buttonState);
+      }  
       lastButtonState = buttonState;
       buttonState = false;
     }
   } 
   else {  
     blinkLed();
+  }
+}
+
+void saveConfigCallback () {
+  if (SPIFFS.begin()) {
+    File configFile = SPIFFS.open(CONFIG_FILE, "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+      return;
+    }
+
+    DynamicJsonDocument json(1024);
+
+    json["mqtt_broker"] = customMqttBroker.getValue();
+    json["mqtt_port"] = customMqttPort.getValue();
+    json["mqtt_user"] = customMqttUser.getValue();
+    json["mqtt_pass"] = customMqttPass.getValue();
+    json["mqtt_topic"] = customMqttRootTopic.getValue();
+
+    serializeJson(json, configFile);
+    configFile.close();
+
+    SPIFFS.end();
+  } else {
+    Serial.println("failed to mount FS");
+  }
+ }
+ 
+void loadCredentials() {
+  if (SPIFFS.begin()) {
+    if (SPIFFS.exists(CONFIG_FILE)) {
+      File configFile = SPIFFS.open(CONFIG_FILE, "r");
+      if (configFile) {
+        size_t size = configFile.size();
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+
+        DynamicJsonDocument json(1024);
+        auto deserializeError = deserializeJson(json, buf.get());
+        if (!deserializeError) {
+          strcpy(mqttBroker, json["mqtt_broker"]);
+          strcpy(mqttPort, json["mqtt_port"]);
+          strcpy(mqttUser, json["mqtt_user"]);
+          strcpy(mqttPass, json["mqtt_pass"]);
+          strcpy(mqttRootTopic, json["mqtt_topic"]);
+        } else {
+          Serial.println("failed to load json config");
+        }
+        configFile.close();
+        SPIFFS.end();
+      }
+    }
+  } else {
+    Serial.println("failed to mount FS");
   }
 }
 
@@ -232,7 +302,21 @@ void initWifi() {
   //wm.resetSettings();
   wm.setConfigPortalBlocking(false);
 
-  if (wm.autoConnect("Temp sensor")){
+  new (&customMqttBroker) WiFiManagerParameter("mqtt_broker", "MQTT broker", mqttBroker, 40);
+  new (&customMqttPort) WiFiManagerParameter("mqtt_port", "MQTT port", mqttPort, 6);
+  new (&customMqttUser) WiFiManagerParameter("mqtt_user", "MQTT user", mqttUser, 20);
+  new (&customMqttPass) WiFiManagerParameter("mqtt_pass", "MQTT pass", mqttPass, 20);
+  new (&customMqttRootTopic) WiFiManagerParameter("mqtt_topic", "MQTT root topic", mqttRootTopic, 30);
+
+  wm.addParameter(&customMqttBroker);
+  wm.addParameter(&customMqttPort);
+  wm.addParameter(&customMqttUser);
+  wm.addParameter(&customMqttPass);
+  wm.addParameter(&customMqttRootTopic);
+
+  wm.setSaveConfigCallback(saveConfigCallback);
+
+  if (wm.autoConnect("Temp sensor")) {
     Serial.println("connected...");
   } else {
     Serial.println("Configportal running");
@@ -247,8 +331,8 @@ void initMQTT() {
   if (mqttClient.connected()) {
     mqttClient.disconnect();
   }
-  Serial.printf("-->[MQTT] Initializing MQTT to broker IP: %s\n", MQTT_BROKER);
-  mqttClient.setServer(MQTT_BROKER, 1883);
+  Serial.printf("-->[MQTT] Initializing MQTT to broker IP: %s\n", mqttBroker);
+  mqttClient.setServer(mqttBroker, atol(mqttPort));
   mqttReconnect();
 }
 
@@ -272,7 +356,7 @@ void publishTempHum(float temp, float hum) {
 void publishFloatMQTT(String topic, float payload) {
   char charPublish[20];
   dtostrf(payload, 0, 2, charPublish);
-  topic = MQTT_ROOT_TOPIC + topic;
+  topic = mqttRootTopic + topic;
   Serial.printf("-->[MQTT] Publishing %.0f to ", payload);
   Serial.println("topic: " + topic);
   mqttClient.publish((topic).c_str(), charPublish);
@@ -281,7 +365,7 @@ void publishFloatMQTT(String topic, float payload) {
 void publishIntMQTT(String topic, int16_t payload) {
   char charPublish[20];
   dtostrf(payload, 0, 0, charPublish);
-  topic = MQTT_ROOT_TOPIC + topic;
+  topic = mqttRootTopic + topic;
   Serial.printf("-->[MQTT] Publishing %d to ", payload);
   Serial.println("topic: " + topic);
   mqttClient.publish((topic).c_str(), charPublish);
@@ -298,17 +382,17 @@ void mqttReconnect() {
     timeStamp = millis();
     if (!mqttClient.connected()) {
       Serial.printf("-->[MQTT] Attempting MQTT connection... ");
-      if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+      if (mqttClient.connect(MQTT_CLIENT_ID, mqttUser, mqttPass)) {
         activeMQTT = true;
-        Serial.printf("connected\n");
+        Serial.println("connected");
       } else {
         ++connectionRetries;
         mqttClient.setSocketTimeout(2);
-        Serial.printf(" not possible to connect to %s ", MQTT_BROKER);
+        Serial.printf(" not possible to connect to %s ", mqttBroker);
         Serial.printf("Connection status:  %d. (%d of %d retries)\n", mqttClient.state(), connectionRetries, MAX_CONNECTION_RETRIES); // Possible States: https://pubsubclient.knolleary.net/api#state
         if (connectionRetries >= MAX_CONNECTION_RETRIES) {
           enableMQTT = false;
-          Serial.printf("-->[MQTT] Max retries to connect to MQTT broker reached, disabling MQTT...\n");
+          Serial.println("-->[MQTT] Max retries to connect to MQTT broker reached, disabling MQTT...");
         }
       }
     }
