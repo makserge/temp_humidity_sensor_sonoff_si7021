@@ -24,7 +24,8 @@
 #define I2C_SCL 39
 
 #define INPUT_PIN 16
-#define LED_PIN 15
+#define LED_PIN  17//15
+#define OUTPUT_PIN 15
 
 #define HOSTNAME "tempsensor"   // http://tempsensor.local
 
@@ -34,6 +35,11 @@
 #define MQTT_PORT "1883"
 #define MQTT_CLIENT_ID "tempsensor"
 #define MQTT_ROOT_TOPIC "tempsensor"
+
+#define MQTT_BUTTON_TOPIC "button"
+#define MQTT_TEMPERATURE_TOPIC "temperature"
+#define MQTT_HUMIDITY_TOPIC "humidity"
+#define MQTT_OUTPUT_TOPIC "output"
 
 #define START_CHECKING_AFTER 15000 //15s
 
@@ -57,12 +63,14 @@ char mqttBroker[40] = MQTT_BROKER;
 char mqttPort[6] = MQTT_PORT;
 char mqttUser[20];
 char mqttPass[20];
-char mqttRootTopic[30] = MQTT_ROOT_TOPIC; 
+char mqttRootTopic[30] = MQTT_ROOT_TOPIC;
 
 WiFiManagerParameter customMqttBroker, customMqttPort, customMqttUser, customMqttPass, customMqttRootTopic;
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
+  pinMode(OUTPUT_PIN, OUTPUT);
+  
   Serial.begin(115200);
   loadCredentials();
   initButton();
@@ -89,9 +97,7 @@ void loop() {
       publishTempHum(temp, hum);
     }
     if (lastButtonState != buttonState) {
-      if (buttonState) {
-        publishButton(buttonState);
-      }  
+      publishButton(buttonState);
       lastButtonState = buttonState;
       buttonState = false;
     }
@@ -327,12 +333,17 @@ void processWifi() {
   wm.process();
 }
 
+void mqttClientCallback(char* topic, byte* payload, unsigned int length) {
+  digitalWrite(OUTPUT_PIN, ((char)payload[0] == '1'));
+}
+
 void initMQTT() {
   if (mqttClient.connected()) {
     mqttClient.disconnect();
   }
   Serial.printf("-->[MQTT] Initializing MQTT to broker IP: %s\n", mqttBroker);
   mqttClient.setServer(mqttBroker, atol(mqttPort));
+  mqttClient.setCallback(mqttClientCallback);
   mqttReconnect();
 }
 
@@ -347,8 +358,8 @@ void mqttClientLoop() {
 
 void publishTempHum(float temp, float hum) {
   if (activeWIFI && mqttClient.connected() && (millis() - lastTimeMQTTPublished >= TIME_BETWEEN_MQTT_PUBLISH * 1000)) {
-    publishFloatMQTT("/temp", temp);
-    publishFloatMQTT("/hum", hum);
+    publishFloatMQTT(MQTT_TEMPERATURE_TOPIC, temp);
+    publishFloatMQTT(MQTT_HUMIDITY_TOPIC, hum);
     lastTimeMQTTPublished = millis();
   }
 }
@@ -356,7 +367,7 @@ void publishTempHum(float temp, float hum) {
 void publishFloatMQTT(String topic, float payload) {
   char charPublish[20];
   dtostrf(payload, 0, 2, charPublish);
-  topic = mqttRootTopic + topic;
+  topic = String(mqttRootTopic) + "/" + topic;
   Serial.printf("-->[MQTT] Publishing %.0f to ", payload);
   Serial.println("topic: " + topic);
   mqttClient.publish((topic).c_str(), charPublish);
@@ -365,14 +376,14 @@ void publishFloatMQTT(String topic, float payload) {
 void publishIntMQTT(String topic, int16_t payload) {
   char charPublish[20];
   dtostrf(payload, 0, 0, charPublish);
-  topic = mqttRootTopic + topic;
+  topic = String(mqttRootTopic) + "/" + topic;
   Serial.printf("-->[MQTT] Publishing %d to ", payload);
   Serial.println("topic: " + topic);
   mqttClient.publish((topic).c_str(), charPublish);
 }
 
 void publishButton(int16_t payload) {
-  publishIntMQTT("/button", payload);
+  publishIntMQTT(MQTT_BUTTON_TOPIC, payload);
 }
 
 void mqttReconnect() {
@@ -384,6 +395,10 @@ void mqttReconnect() {
       Serial.printf("-->[MQTT] Attempting MQTT connection... ");
       if (mqttClient.connect(MQTT_CLIENT_ID, mqttUser, mqttPass)) {
         activeMQTT = true;
+        
+        String subscribeTopic = String(mqttRootTopic) + "/" + MQTT_OUTPUT_TOPIC;
+        mqttClient.subscribe(subscribeTopic.c_str());
+        
         Serial.println("connected");
       } else {
         ++connectionRetries;
