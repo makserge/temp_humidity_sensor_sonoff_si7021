@@ -1,4 +1,3 @@
-#include <Wire.h>
 #include <FS.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h> // https://github.com/bblanchon/ArduinoJson
@@ -6,31 +5,16 @@
 #include "src/WiFiManager/WiFiManager.h" // https://github.com/tzapu/WiFiManager
 #include "PubSubClient.h"
 
-#define HTU21D_I2C_ADDRESS 0x40
-
-#define HTU21D_RES_RH8_TEMP12 0x01
-#define HTU21D_HEATER_ON 0x04
-#define HTU21D_HEATER_OFF 0xFB
-#define HTU21D_USER_REGISTER_WRITE 0xE6
-#define HTU21D_USER_REGISTER_READ 0xE7
-#define HTU21D_TRIGGER_TEMP_MEASURE_HOLD 0xE3
-#define HTU21D_CRC8_POLYNOMINAL 0x13100
-#define HTU21D_TEMP_COEFFICIENT -0.15
-#define HTU21D_TRIGGER_HUMD_MEASURE_HOLD 0xE5
-
-#define I2C_ERROR 0xFF
-
-#define I2C_SDA 40
-#define I2C_SCL 39
-
+#define SENSOR_PIN 21
 #define INPUT_PIN 16
-#define LED_PIN  17//15
-#define OUTPUT_PIN 15
+#define LED_PIN  15
+#define OUTPUT_PIN 17
 
 #define HOSTNAME "tempsensor"   // http://tempsensor.local
 
 #define CONFIG_FILE "/config.json"
 
+#define MQTT_SOCKET_TIMEOUT 60
 #define MQTT_BROKER "192.168.8.100"
 #define MQTT_PORT "1883"
 #define MQTT_CLIENT_ID "tempsensor"
@@ -47,12 +31,15 @@
 #define SECONDS_BETWEEN_RETRIES 15
 #define MAX_CONNECTION_RETRIES 5
 
-#define BLINK_LED_TICK_PERIOD 1000
+#define BLINK_LED_TICK_PERIOD_NO_WIFI 1000
+#define BLINK_LED_TICK_PERIOD_WIFI 5
+#define BLINK_LED_TICK_PERIOD_NO_SENSOR 10000
+#define BLINK_LED_TICK_PERIOD_NO_MQTT 50000
 
 bool activeWIFI, enableMQTT, activeMQTT, lastButtonState, buttonState, lastLedState;
 int64_t lastReadingsCommunicationTime, lastTimeMQTTPublished;
 float temp, hum, lastTemp, lastHum;
-int32_t ledTick;
+int32_t ledTick, ledTickPeriod;
 
 OneButton button(INPUT_PIN, true, true);
 WiFiManager wm;
@@ -66,7 +53,7 @@ char mqttPass[20];
 char mqttRootTopic[30] = MQTT_ROOT_TOPIC;
 
 WiFiManagerParameter customMqttBroker, customMqttPort, customMqttUser, customMqttPass, customMqttRootTopic;
-
+ 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   pinMode(OUTPUT_PIN, OUTPUT);
@@ -85,8 +72,7 @@ void loop() {
     mqttClientLoop();
     if ((millis() - lastReadingsCommunicationTime >= START_CHECKING_AFTER)) {
       lastReadingsCommunicationTime = millis();
-
-      readSensor(temp, hum);
+      readSensor(SENSOR_PIN);
     }
     if (lastTemp != temp) {
       lastTemp = temp;
@@ -102,9 +88,7 @@ void loop() {
       buttonState = false;
     }
   } 
-  else {  
-    blinkLed();
-  }
+  blinkLed();
 }
 
 void saveConfigCallback () {
@@ -163,116 +147,55 @@ void loadCredentials() {
 }
 
 void initSensor() {
-  Wire.begin(I2C_SDA, I2C_SCL);
-  
-  uint8_t userRegisterData = 0;
-
-  Wire.beginTransmission(HTU21D_I2C_ADDRESS);
-  Wire.write(HTU21D_USER_REGISTER_READ);
-  Wire.endTransmission(true);
-  Wire.requestFrom(HTU21D_I2C_ADDRESS, 1);
-  if (Wire.available() != 1) {
-    return;
-  }
-  userRegisterData = Wire.read();
-
-  userRegisterData &= 0x7E;
-  userRegisterData |= HTU21D_RES_RH8_TEMP12;
-  userRegisterData &= HTU21D_HEATER_OFF;
-  
-  Wire.beginTransmission(HTU21D_I2C_ADDRESS);
-  Wire.write(HTU21D_USER_REGISTER_WRITE);
-  Wire.write(userRegisterData);
-  Wire.endTransmission(true);
+  pinMode(SENSOR_PIN, INPUT);
+  delay(2000);
+  readSensor(SENSOR_PIN);
 }
 
-float readTemperature() {
-  int8_t qntRequest = 3;
-  uint16_t rawTemperature = 0;
-  uint8_t checksum = 0;
-
-  Wire.beginTransmission(HTU21D_I2C_ADDRESS);
-  Wire.write(HTU21D_TRIGGER_TEMP_MEASURE_HOLD);
-  if (Wire.endTransmission(true) != 0) {
-    return I2C_ERROR;
+bool waitState(int pin, bool state) {
+  uint64_t timeout = micros();
+  while (micros() - timeout < 100) {
+    if (digitalRead(pin) == state) return true;
+    delayMicroseconds(1);
   }
-
-  delay(22);
-
-  Wire.requestFrom(HTU21D_I2C_ADDRESS, qntRequest);
-  if (Wire.available() != qntRequest) {
-    return I2C_ERROR;
-  }
-  rawTemperature = Wire.read() << 8;
-  rawTemperature |= Wire.read();
-  checksum = Wire.read();
-  
-  if (checkCRC8(rawTemperature) != checksum) {
-    return I2C_ERROR;
-  }
-  return (0.002681 * (float)rawTemperature - 46.85);
+  return false;
 }
 
-float readCompensatedHumidity(float temperature) {
-  float humidity = readHumidity();
-  if (humidity == I2C_ERROR || temperature == I2C_ERROR) {
-    return I2C_ERROR;
-  }
-  if (temperature > 0 && temperature < 80) {
-    humidity = humidity + (25.0 - temperature) * HTU21D_TEMP_COEFFICIENT;
-  }
-  return humidity;
-}
+void readSensor(int pin) {
+  uint8_t data[5] = {0};
 
-uint8_t checkCRC8(uint16_t data) {
-  for (uint8_t bit = 0; bit < 16; bit++) {
-    if (data & 0x8000) {
-      data = (data << 1) ^ HTU21D_CRC8_POLYNOMINAL;
-    } else {
-      data <<= 1;
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+  delayMicroseconds(500);
+  digitalWrite(pin, HIGH);
+  delayMicroseconds(20);
+  pinMode(pin, INPUT);
+
+  uint32_t i = 0;
+  if (waitState(pin, 0) && waitState(pin, 1) && waitState(pin, 0)) {
+    for (i = 0; i < 40; i++) {
+      if (!waitState(pin, 1)) {
+        break;
+      }
+      delayMicroseconds(35);
+      if (digitalRead(pin) == HIGH) {
+        data[i / 8] |= (1 << (7 - i % 8));
+      }
+      if (!waitState(pin, 0)) {
+        break;
+      }
     }
   }
-  return data >>= 8;
-}
 
-float readHumidity() {
-  uint16_t rawHumidity = 0;
-  uint8_t checksum = 0;
-  float humidity = 0;
-
-  Wire.beginTransmission(HTU21D_I2C_ADDRESS);
-  Wire.write(HTU21D_TRIGGER_HUMD_MEASURE_HOLD);
-  if (Wire.endTransmission(true) != 0) {
-    return I2C_ERROR;
+  uint8_t checksum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
+  if ((i == 40)&& (data[4] == checksum)) {
+    double tempInternal = (((data[2] & 0x7F) << 8) | data[3]) * 0.1;
+    if (data[2] & 0x80) {
+      tempInternal *= -1;
+    }
+    temp = tempInternal;  
+    hum = ((data[0] << 8) | data[1]) * 0.1;
   }
-  delay(4);
-  Wire.requestFrom(HTU21D_I2C_ADDRESS, 3);
-  if (Wire.available() != 3) {
-    return I2C_ERROR;
-  }
-
-  rawHumidity = Wire.read() << 8;
-  rawHumidity |= Wire.read();
-  checksum = Wire.read();
- 
-  if (checkCRC8(rawHumidity) != checksum) {
-    return I2C_ERROR;
-  }
-
-  rawHumidity ^= 0x02;
-  humidity = (0.001907 * (float)rawHumidity - 6);
-  
-  if (humidity < 0) {
-    humidity = 0;
-  } else if (humidity > 100) {
-    humidity = 100;
-  }
-  return humidity;
-}
-
-void readSensor(float &temp, float &hum) {
-  temp = readTemperature();
-  hum = readCompensatedHumidity(temp);
 }
 
 void initButton() {
@@ -286,12 +209,14 @@ void clickButton() {
 void WiFiEvent(WiFiEvent_t event) {
   switch (event) {
     case SYSTEM_EVENT_STA_GOT_IP:
+      ledTickPeriod = BLINK_LED_TICK_PERIOD_WIFI;
       activeWIFI = true;
       enableMQTT = true;
       initMQTT();
       digitalWrite(LED_PIN, HIGH);
       break;
     case WL_DISCONNECTED:
+      ledTickPeriod = BLINK_LED_TICK_PERIOD_NO_WIFI;
       activeWIFI = false;
       enableMQTT = false;
       break;  
@@ -301,6 +226,7 @@ void WiFiEvent(WiFiEvent_t event) {
 }
 
 void initWifi() {
+  ledTickPeriod = BLINK_LED_TICK_PERIOD_NO_WIFI;
   WiFi.mode(WIFI_STA);
   WiFi.onEvent(WiFiEvent); 
     
@@ -342,6 +268,7 @@ void initMQTT() {
     mqttClient.disconnect();
   }
   Serial.printf("-->[MQTT] Initializing MQTT to broker IP: %s\n", mqttBroker);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT);
   mqttClient.setServer(mqttBroker, atol(mqttPort));
   mqttClient.setCallback(mqttClientCallback);
   mqttReconnect();
@@ -398,6 +325,8 @@ void mqttReconnect() {
         
         String subscribeTopic = String(mqttRootTopic) + "/" + MQTT_OUTPUT_TOPIC;
         mqttClient.subscribe(subscribeTopic.c_str());
+
+        publishTempHum(temp, hum);
         
         Serial.println("connected");
       } else {
@@ -406,8 +335,10 @@ void mqttReconnect() {
         Serial.printf(" not possible to connect to %s ", mqttBroker);
         Serial.printf("Connection status:  %d. (%d of %d retries)\n", mqttClient.state(), connectionRetries, MAX_CONNECTION_RETRIES); // Possible States: https://pubsubclient.knolleary.net/api#state
         if (connectionRetries >= MAX_CONNECTION_RETRIES) {
-          enableMQTT = false;
+          ledTickPeriod = BLINK_LED_TICK_PERIOD_NO_MQTT;
           Serial.println("-->[MQTT] Max retries to connect to MQTT broker reached, disabling MQTT...");
+          delay(3000);
+          connectionRetries = 0;
         }
       }
     }
@@ -415,7 +346,7 @@ void mqttReconnect() {
 }
 
 void blinkLed() {
-  if (ledTick == BLINK_LED_TICK_PERIOD) {
+  if (ledTick == ledTickPeriod) {
     ledTick = 0;
     lastLedState = !lastLedState;
     digitalWrite(LED_PIN, lastLedState);
